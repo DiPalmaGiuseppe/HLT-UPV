@@ -2,4 +2,8 @@
 /whisper/Whisper_Trabajo/fechas2/
 /whisper/Whisper_Trabajo/musan_small/
 /whisper/Whisper_Trabajo/RIRS_NOISES/
+/whisper/Whisper_Trabajo/model_*
+
 /lab_1/
+
+__pycache__/
