@@ -1,5 +1,6 @@
 import torch, torchaudio
 import numpy as np
+import torch.nn.functional as F
 
 
 class FeedForward(torch.nn.Module):
@@ -345,7 +346,6 @@ class AudioTransformer(torch.nn.Module):
         with torch.no_grad():
             enc = self.encoder(x.to(device))
 
-            # beam = [(sequence, log_prob)]
             beams = [([sos], 0.0)]
 
             for _ in range(self.seq_len):
@@ -353,7 +353,6 @@ class AudioTransformer(torch.nn.Module):
 
                 for seq, score in beams:
                     if seq[-1] == eos:
-                        # se già finita, la manteniamo
                         new_beams.append((seq, score))
                         continue
 
@@ -368,10 +367,8 @@ class AudioTransformer(torch.nn.Module):
                         new_score = score + topk_log_probs[0, k].item()
                         new_beams.append((new_seq, new_score))
 
-                # tieni solo i migliori beam_size
                 beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
 
-                # early stop
                 if all(seq[-1] == eos for seq, _ in beams):
                     break
 
