@@ -252,14 +252,17 @@ class AudioTransformer(torch.nn.Module):
         return loss
     
            
-    def generate(self, x, tokenizer):
+    def generate(self, x, tokenizer, action = None):
         device = next(self.parameters()).device
         self.eval()
 
         sos = tokenizer.word2index['<sos>']
         eos = tokenizer.word2index['<eos>']
-
-        y = [sos]
+        if action:
+            action_tok = tokenizer.word2index[f'<{action}>']
+            y = [sos, action_tok]
+        else:
+            y = [sos]
 
         with torch.no_grad():
             enc = self.encoder(x.to(device))
@@ -272,3 +275,105 @@ class AudioTransformer(torch.nn.Module):
 
         return y
     
+    def generate_sampling(self, x, tokenizer, temperature=1.0, action = None):
+        self.eval()
+        device = next(self.parameters()).device
+
+        sos = tokenizer.word2index['<sos>']
+        eos = tokenizer.word2index['<eos>']
+        if action:
+            action_tok = tokenizer.word2index[f'<{action}>']
+            y = [sos, action_tok]
+        else:
+            y = [sos]
+
+        with torch.no_grad():
+            enc = self.encoder(x.to(device))
+
+            while len(y) < self.seq_len and y[-1] != eos:
+                y_tensor = torch.tensor(y).unsqueeze(0).to(device)
+                logits = self.decoder(y_tensor, enc)
+
+                logits = logits[:, -1, :] / temperature
+                probs = torch.softmax(logits, dim=-1)
+
+                next_token = torch.multinomial(probs, 1).item()
+                y.append(next_token)
+
+        return y
+    
+    def top_k_sampling(self, logits, k):
+        logits = logits.squeeze(0)  # [vocab]
+        topk_logits, topk_indices = torch.topk(logits, k)
+
+        probs = torch.softmax(topk_logits, dim=-1)
+        sampled_idx = torch.multinomial(probs, 1).item()
+
+        return topk_indices[sampled_idx].item()
+
+    
+    def generate_topk(self, x, tokenizer, k=5, action = None):
+        self.eval()
+        device = next(self.parameters()).device
+
+        sos = tokenizer.word2index['<sos>']
+        eos = tokenizer.word2index['<eos>']
+        if action:
+            action_tok = tokenizer.word2index[f'<{action}>']
+            y = [sos, action_tok]
+        else:
+            y = [sos]
+
+        with torch.no_grad():
+            enc = self.encoder(x.to(device))
+
+            while len(y) < self.seq_len and y[-1] != eos:
+                y_tensor = torch.tensor(y).unsqueeze(0).to(device)
+                logits = self.decoder(y_tensor, enc)
+                next_token = self.top_k_sampling(logits[:, -1, :], k)
+                y.append(next_token)
+
+        return y
+    
+    def generate_beam_search(self, x, tokenizer, beam_size=5):
+        device = next(self.parameters()).device
+        self.eval()
+
+        sos = tokenizer.word2index['<sos>']
+        eos = tokenizer.word2index['<eos>']
+
+        with torch.no_grad():
+            enc = self.encoder(x.to(device))
+
+            # beam = [(sequence, log_prob)]
+            beams = [([sos], 0.0)]
+
+            for _ in range(self.seq_len):
+                new_beams = []
+
+                for seq, score in beams:
+                    if seq[-1] == eos:
+                        # se già finita, la manteniamo
+                        new_beams.append((seq, score))
+                        continue
+
+                    y_tensor = torch.tensor(seq).unsqueeze(0).to(device)
+                    logits = self.decoder(y_tensor, enc)
+                    log_probs = F.log_softmax(logits[:, -1, :], dim=-1)
+
+                    topk_log_probs, topk_ids = torch.topk(log_probs, beam_size)
+
+                    for k in range(beam_size):
+                        new_seq = seq + [topk_ids[0, k].item()]
+                        new_score = score + topk_log_probs[0, k].item()
+                        new_beams.append((new_seq, new_score))
+
+                # tieni solo i migliori beam_size
+                beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
+
+                # early stop
+                if all(seq[-1] == eos for seq, _ in beams):
+                    break
+
+            best_seq = beams[0][0]
+            return best_seq
