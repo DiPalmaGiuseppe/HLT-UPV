@@ -1,6 +1,7 @@
 import torch, torchaudio
 import numpy as np
 import torch.nn.functional as F
+import copy
 
 
 class FeedForward(torch.nn.Module):
@@ -84,7 +85,7 @@ class CausalSelfAttention(torch.nn.Module):
 
     def forward(self, x):
         x = self.norm(x)
-        b, n, d = x.shape
+        b, n, _= x.shape
         q = self.q_linear(x).view(b, -1, self.n_heads, self.d_head)
         k = self.k_linear(x).view(b, -1, self.n_heads, self.d_head)
         v = self.v_linear(x).view(b, -1, self.n_heads, self.d_head) 
@@ -99,6 +100,27 @@ class CausalSelfAttention(torch.nn.Module):
         out = self.dropout(out)
         out = self.out(out)
         return out
+    
+    # Optional 4 (Added chache)
+    def forward_step(self, x, past_k=None, past_v=None):
+        x = self.norm(x)
+        b, n, _ = x.shape
+
+        q = self.q_linear(x).view(b, n, self.n_heads, self.d_head)
+        k = self.k_linear(x).view(b, n, self.n_heads, self.d_head)
+        v = self.v_linear(x).view(b, n, self.n_heads, self.d_head)
+
+        if past_k is not None:
+            k = torch.cat([past_k, k], dim=1)
+            v = torch.cat([past_v, v], dim=1)
+
+        scores = torch.einsum('bihd,bjhd->bhij', q, k) / self.scale
+        att = scores.softmax(dim=-1)
+
+        out = torch.einsum('bhij,bjhd->bihd', att, v)
+        out = out.reshape(b, n, self.n_heads * self.d_head)
+
+        return self.out(out), k, v
 
 class CrossAttention(torch.nn.Module):
     def __init__(self, d_model, n_heads=8, d_head=64, dropout=0.1, **kwargs):
@@ -150,6 +172,24 @@ class Decoder(torch.nn.Module):
             x = x + cross_att(x, enc)[0]
             x = x + ff(x)            
         return x
+    
+    def forward_step(self, x, enc, past_k, past_v):
+        new_past_k = []
+        new_past_v = []
+
+        for i, (att, cross_att, ff) in enumerate(
+            zip(self.att, self.cross_att, self.ff)
+        ):
+            # uses cached keys and values for efficiency
+            out, k, v = att.forward_step(x, past_k[i], past_v[i])
+            x = x + out
+            x = x + cross_att(x, enc)[0]
+            x = x + ff(x)
+
+            new_past_k.append(k)
+            new_past_v.append(v)
+
+        return x, new_past_k, new_past_v    
 
 class SpecAug(torch.nn.Module):
     def __init__(self, prob_t_warp=0.5,
@@ -268,10 +308,19 @@ class AudioTransformer(torch.nn.Module):
         with torch.no_grad():
             enc = self.encoder(x.to(device))
 
+            past_k = [None] * len(self.dec.att)
+            past_v = [None] * len(self.dec.att)
+
             while y[-1] != eos and len(y) < self.seq_len:
-                y_tensor = torch.tensor(y).unsqueeze(0).to(device)
-                logits = self.decoder(y_tensor, enc)
-                next_token = logits.argmax(-1)[:, -1].item()
+                y_last = torch.tensor([[y[-1]]]).to(device)
+                y_emb = self.emb(y_last)
+
+                dec_out, past_k, past_v = self.dec.forward_step(
+                    y_emb, enc, past_k, past_v
+                )
+
+                logits = self.out(dec_out)
+                next_token = logits.argmax(-1).item()
                 y.append(next_token)
 
         return y
@@ -291,11 +340,18 @@ class AudioTransformer(torch.nn.Module):
         with torch.no_grad():
             enc = self.encoder(x.to(device))
 
-            while len(y) < self.seq_len and y[-1] != eos:
-                y_tensor = torch.tensor(y).unsqueeze(0).to(device)
-                logits = self.decoder(y_tensor, enc)
+            past_k = [None] * len(self.dec.att)
+            past_v = [None] * len(self.dec.att)
 
-                logits = logits[:, -1, :] / temperature
+            while y[-1] != eos and len(y) < self.seq_len:
+                y_last = torch.tensor([[y[-1]]]).to(device)
+                y_emb = self.emb(y_last)
+
+                dec_out, past_k, past_v = self.dec.forward_step(
+                    y_emb, enc, past_k, past_v
+                )
+
+                logits = self.out(dec_out)[:, -1, :] / temperature
                 probs = torch.softmax(logits, dim=-1)
 
                 next_token = torch.multinomial(probs, 1).item()
@@ -312,8 +368,7 @@ class AudioTransformer(torch.nn.Module):
 
         return topk_indices[sampled_idx].item()
 
-    
-    def generate_topk(self, x, tokenizer, k=5, action = None):
+    def generate_topk(self, x, tokenizer, k = 5, action = None):
         self.eval()
         device = next(self.parameters()).device
 
@@ -328,48 +383,96 @@ class AudioTransformer(torch.nn.Module):
         with torch.no_grad():
             enc = self.encoder(x.to(device))
 
-            while len(y) < self.seq_len and y[-1] != eos:
-                y_tensor = torch.tensor(y).unsqueeze(0).to(device)
-                logits = self.decoder(y_tensor, enc)
-                next_token = self.top_k_sampling(logits[:, -1, :], k)
+            past_k = [None] * len(self.dec.att)
+            past_v = [None] * len(self.dec.att)
+
+            while y[-1] != eos and len(y) < self.seq_len:
+                y_last = torch.tensor([[y[-1]]]).to(device)
+                y_emb = self.emb(y_last)
+
+                dec_out, past_k, past_v = self.dec.forward_step(
+                    y_emb, enc, past_k, past_v
+                )
+
+                logits = self.out(dec_out)[:, -1, :]
+                next_token = self.top_k_sampling(logits, k)
                 y.append(next_token)
 
         return y
     
-    def generate_beam_search(self, x, tokenizer, beam_size=5):
+    def generate_beam_search(self, x, tokenizer, beam_size=5, action=None):
         device = next(self.parameters()).device
         self.eval()
 
         sos = tokenizer.word2index['<sos>']
         eos = tokenizer.word2index['<eos>']
 
+        if action:
+            action_tok = tokenizer.word2index[f'<{action}>']
+            init_seq = [sos, action_tok]
+        else:
+            init_seq = [sos]
+
         with torch.no_grad():
             enc = self.encoder(x.to(device))
 
-            beams = [([sos], 0.0)]
+            past_k = [None] * len(self.dec.att)
+            past_v = [None] * len(self.dec.att)
 
-            for _ in range(self.seq_len):
+            for tok in init_seq[:-1]:
+                y_last = torch.tensor([[tok]]).to(device)
+                y_emb = self.emb(y_last)
+                _, past_k, past_v = self.dec.forward_step(
+                    y_emb, enc, past_k, past_v
+                )
+
+            beams = [
+                (
+                    init_seq,
+                    0.0,
+                    past_k,
+                    past_v,
+                )
+            ]
+
+            for _ in range(self.seq_len - len(init_seq)):
                 new_beams = []
 
-                for seq, score in beams:
+                for seq, score, past_k, past_v in beams:
+
                     if seq[-1] == eos:
-                        new_beams.append((seq, score))
+                        new_beams.append((seq, score, past_k, past_v))
                         continue
 
-                    y_tensor = torch.tensor(seq).unsqueeze(0).to(device)
-                    logits = self.decoder(y_tensor, enc)
-                    log_probs = F.log_softmax(logits[:, -1, :], dim=-1)
+                    y_last = torch.tensor([[seq[-1]]]).to(device)
+                    y_emb = self.emb(y_last)
 
-                    topk_log_probs, topk_ids = torch.topk(log_probs, beam_size)
+                    dec_out, new_past_k, new_past_v = self.dec.forward_step(
+                        y_emb, enc, past_k, past_v
+                    )
 
+                    logits = self.out(dec_out)[:, -1, :]
+                    log_probs = F.log_softmax(logits, dim=-1)
+
+                    topk_log_probs, topk_ids = torch.topk(log_probs, beam_size, dim=-1)
+                    topk_log_probs = topk_log_probs.squeeze(0)
+                    topk_ids = topk_ids.squeeze(0)
                     for k in range(beam_size):
-                        new_seq = seq + [topk_ids[0, k].item()]
-                        new_score = score + topk_log_probs[0, k].item()
-                        new_beams.append((new_seq, new_score))
+                        new_seq = seq + [topk_ids[k].item()]
+                        new_score = score + topk_log_probs[k].item()
+
+                        new_beams.append(
+                            (
+                                new_seq,
+                                new_score,
+                                copy.deepcopy(new_past_k),
+                                copy.deepcopy(new_past_v),
+                            )
+                        )
 
                 beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
 
-                if all(seq[-1] == eos for seq, _ in beams):
+                if all(seq[-1] == eos for seq, _, _, _ in beams):
                     break
 
             best_seq = beams[0][0]
