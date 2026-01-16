@@ -4,6 +4,9 @@
 /whisper/Whisper_Trabajo/RIRS_NOISES/
 /whisper/Whisper_Trabajo/model_*
 
+/whisper/Whisper_Trabajo/report/*
+!/whisper/Whisper_Trabajo/report/main.pdf
+
 /lab_1/
 
 __pycache__/
